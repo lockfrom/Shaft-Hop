@@ -25,8 +25,8 @@ const LX = WALL, RX = W - WALL; // внутренние грани стен
 const CFG = {
   size: 22,                    // размер игрока
   jumpTime: 0.28,              // время перелёта между стенами, с
-  baseSpeed: 135,              // стартовая скорость подъёма, ед/с (щадящий старт)
-  speedPerM: 0.3,              // прирост скорости за метр
+  baseSpeed: 155,              // стартовая скорость подъёма, ед/с
+  speedPerM: 0.28,             // прирост скорости за метр до 800 м, дальше медленнее, но без потолка
   maxSpeed: 400,
   buffer: 0.15,                // буфер ввода перед приземлением, с
   near: 8,                     // дистанция near miss
@@ -126,6 +126,10 @@ Object.assign(STR.en, {
   pResume:'RESUME', pExit:'END RUN', chestGot:'Chest contents', extraAd:'+1 for an ad', newTrail:'New trail', pts:'pts', freeItem:'Start gift',
   talNone:'Not enough points: each level gives 1',
 });
+Object.assign(STR.ru, { ghost:'ПРИЗРАК', ghostSub:'обгони себя', ghostNone:'Сначала пройди обычный забег', ghostAhead:'Призрак впереди', ghostBehind:'Призрак позади', ghostWin:'ПРОШЛЫЙ ТЫ ПОБЕЖДЁН!', ghostWinSub:'+40 монет', ghostEnd:'конец призрака',
+  dark:'ТЕМНОТА', darkSub:'держись ближе к свету', spring:'ПРУЖИНА!', speedUp:'БЫСТРЕЕ!' });
+Object.assign(STR.en, { ghost:'GHOST', ghostSub:'beat yourself', ghostNone:'Play a normal run first', ghostAhead:'Ghost ahead', ghostBehind:'Ghost behind', ghostWin:'PAST YOU BEATEN!', ghostWinSub:'+40 coins', ghostEnd:'ghost end',
+  dark:'DARKNESS', darkSub:'stay close to the light', spring:'SPRING!', speedUp:'FASTER!' });
 let L = STR.ru;
 
 /* ============================== 3. YT SDK WRAPPER ============================== */
@@ -328,6 +332,7 @@ let revived = false, reviveT = 0, reviveLock = 0, x2used = false, adWatched = fa
 let toast = null, lastHM = 0, nextMile = 100, banner = null;
 let rocketT = 0, lastZone = 0, hudPulse = 0, feverT = 0, keysRun = 0;
 let chest = null;
+let darkK = 0, ghostMode = false, runSeed = 0, ghostRec = [], ghostRecT = 0, ghostBeat = false, headUsed = false;
 let lettersGot = 0, wordXP = 0, itemUse = { bomb: 0, slow: 0, dash: 0 }, nextBurnY = 0; // открываемый сундук: { rew, t, opened }
 const flyers = [], speedLines = [];
 const toastQ = [];
@@ -339,13 +344,21 @@ function showToast(t) {
 const popups = [];
 const parts = []; for (let i = 0; i < 220; i++) parts.push({ life: 0 });
 
-function speedAt(wy) { return Math.min(CFG.baseSpeed + (wy / 10) * CFG.speedPerM, CFG.maxSpeed); }
+function speedAt(wy) {
+  const m = wy / 10;
+  let v = CFG.baseSpeed + Math.min(m, 800) * CFG.speedPerM + Math.max(0, m - 800) * 0.06;
+  // на каждой новой зоне темп заметно подрастает (плавно за 40 м)
+  for (let i = 1; i < THEMES.length; i++) v += 18 * Math.max(0, Math.min(1, (m - THEMES[i].m) / 40));
+  return v;
+}
 function diffAt(wy) { const m = wy / 10; return m < 100 ? 1 : Math.min(5, 1 + Math.floor(m / 200)); }
 
 function reset(seed) {
-  rng = mulberry32(seed !== undefined ? seed : (Math.random() * 4294967296) >>> 0);
+  runSeed = seed !== undefined ? seed : (Math.random() * 4294967296) >>> 0;
+  rng = mulberry32(runSeed);
+  darkK = 0; ghostRec = []; ghostRecT = 0; ghostBeat = false; headUsed = false;
   P = { x: PLX, y: 0, side: -1, st: 'wall', t: 0, dur: CFG.jumpTime, fx: PLX, tx: PLX, target: -1, rev: false, buf: 0, sq: 0, trail: [], trailT: 0 };
-  objs = []; genY = 420; hardRun = 0; nextPowerY = 2200 + rng() * 800;
+  objs = []; genY = 420; hardRun = 0; nextPowerY = 2200 + rng() * 800; nextDarkY = 4500;
   camY = 0; speed = CFG.baseSpeed; heightM = 0; pts = 0; score = 0; coinsRun = 0; streak = 0; mult = 1;
   shieldN = 1 + save.up.shield; invT = 0; magnetT = 0; slowT = 0; shakeT = 0; flashT = 0; // бесплатный щит на каждый забег (+ прокачка)
   newBest = false; bestCrossed = save.bestH < 15; popups.length = 0;
@@ -416,13 +429,16 @@ function genRest() {
   const len = 240;
   let s = -1;
   for (let y = genY + 20; y < genY + len - 20; y += 70) { for (let k = 0; k < 2; k++) addCoin(wallX(s) + CFG.size / 2, y + k * 24 + CFG.size / 2, true); s = -s; }
+  // все случайные числа берём заранее: уровень с тем же сидом одинаков при любой прокачке
+  const rk = rng(), rp = rng(), rl = rng(), rkey = rng(), rs = rng();
+  if (genY > 1000 && rs < 0.3) objs.push({ type: 'spring', side: rs < 0.15 ? -1 : 1, y: genY + 30, used: false });
   if (genY > nextPowerY) {
-    const rk = rng(), kind = rk < 0.36 ? 'shield' : rk < 0.72 ? 'magnet' : 'rocket';
+    const kind = rk < 0.36 ? 'shield' : rk < 0.72 ? 'magnet' : 'rocket';
     objs.push({ type: 'power', kind: genY < 3000 && kind === 'rocket' ? 'shield' : kind, x: W / 2, y: genY + len / 2, taken: false });
-    nextPowerY = genY + (2500 + rng() * 1500) * (1 - save.up.luck * 0.1);
-  } else if (genY > 300 && rng() < 0.3 * letterP()) {
+    nextPowerY = genY + (2500 + rp * 1500) * (1 - save.up.luck * 0.1);
+  } else if (genY > 300 && rl < 0.3 * letterP()) {
     objs.push({ type: 'letter', x: W / 2, y: genY + len / 2, taken: false });
-  } else if (genY > 800 && rng() < 0.4 * (1 + tl('keys') * 0.08 + (hasPet('fox') ? 0.25 : 0))) {
+  } else if (genY > 800 && rkey < 0.4 * (1 + tl('keys') * 0.08 + (hasPet('fox') ? 0.25 : 0))) {
     objs.push({ type: 'key', x: W / 2, y: genY + len / 2, taken: false }); // ключ в центре: берётся в прыжке
   }
   genY += len;
@@ -483,7 +499,18 @@ function genCrumble() {
     side = -side;
   }
 }
+// Катящийся шар (с 250 м): катится по стене вниз навстречу, уходи на другую стену
+function genRoller() {
+  const d = diffAt(genY), s = rng() < 0.5 ? -1 : 1;
+  genY += 120;
+  objs.push({ type: 'roller', side: s, y: genY + 300, x: s < 0 ? LX + 13 : RX - 13, r: 13, rot: 0, act: false, nm: false });
+  for (let k = 0; k < 4; k++) addCoin(wallX(-s) + CFG.size / 2, genY + 60 + k * 50);
+  genY += 200 + gapFor(d);
+}
+let nextDarkY = 0;
 function genPattern() {
+  // тёмный участок (с 450 м): видно только вокруг игрока
+  if (genY > nextDarkY) { if (nextDarkY > 0) objs.push({ type: 'dark', y: genY, h: 1300 }); nextDarkY = genY + 5000 + rng() * 2500; }
   const d = diffAt(genY);
   let pick;
   if (hardRun >= 2) { pick = 'rest'; hardRun = 0; }
@@ -496,6 +523,7 @@ function genPattern() {
     if (genY >= 3000) opts.push('mover', 'mover');
     if (genY >= 4000) opts.push('pend', 'pend');
     if (genY >= 2000) opts.push('bat', 'bat');
+    if (genY >= 2500) opts.push('roller', 'roller');
     if (genY >= 1500) opts.push('crumble', 'crumble');
     pick = opts[(rng() * opts.length) | 0];
   }
@@ -509,13 +537,14 @@ function genPattern() {
   if (pick === 'mover')  genMover();
   if (pick === 'pend')   genPend();
   if (pick === 'bat')    genBat();
+  if (pick === 'roller') genRoller();
   if (pick === 'crumble') genCrumble();
   if (pick !== 'rest' && d >= 4) hardRun++;
 }
 function ensureGen() { while (genY < camY + VH + 300) genPattern(); }
 function cleanup() {
   const lim = camY - 400;
-  objs = objs.filter(o => (o.type === 'spike' || o.type === 'crumble' ? o.y + o.h : o.y + 30) > lim);
+  objs = objs.filter(o => (o.type === 'spike' || o.type === 'crumble' || o.type === 'dark' ? o.y + o.h : o.y + 30) > lim);
 }
 
 /* ============================== 11. PLAYER / RULES ============================== */
@@ -593,7 +622,7 @@ const ITEMS = [
   { k: 'slow', price: 100, c: '#7fd8ff' },
   { k: 'dash', price: 120, c: '#ffb03a' },
 ];
-const DANGER = ['spike', 'saw', 'block', 'laser', 'mspike', 'pend', 'bat', 'crumble'];
+const DANGER = ['spike', 'saw', 'block', 'laser', 'mspike', 'pend', 'bat', 'crumble', 'roller'];
 const itemMax = () => 1 + save.up.pocket;
 const itemReady = k => save.items[k] > 0 && itemUse[k] < itemMax();
 function blast(o) {
@@ -668,7 +697,7 @@ function revive() {
   if (P.st === 'jump') P.side = P.target;
   P.st = 'wall'; P.x = wallX(P.side); P.buf = 0; P.trail.length = 0;
   // убрать опасности рядом с игроком, чтобы он не умер сразу
-  objs = objs.filter(o => !(['spike', 'saw', 'block', 'laser', 'mspike', 'pend', 'bat', 'crumble'].includes(o.type) &&
+  objs = objs.filter(o => !(['spike', 'saw', 'block', 'laser', 'mspike', 'pend', 'bat', 'crumble', 'roller'].includes(o.type) &&
     o.y < P.y + 320 && (o.type === 'spike' ? o.y + o.h : o.y + 30) > P.y - 80));
   invT = 2; state = 'COUNT'; countT = 0.9;
   AU.init(); AU.resume(); AU.power();
@@ -707,6 +736,8 @@ function grantXP() {
 function gameOver() {
   state = 'OVER'; overT = 0;
   grantXP();
+  // лучший забег без «быстрого старта» становится призраком
+  if (!dailyMode && !headUsed && heightM > 20 && heightM > ((save.ghost && save.ghost.h) || 0)) save.ghost = { seed: runSeed, h: Math.floor(heightM), d: ghostRec.slice() };
   mission('runs', 1);
   if (dailyMode) {
     const k = todayKey(new Date());
@@ -898,12 +929,13 @@ let dailyMode = false;
 const dailySeed = () => { const d = new Date(); return d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate(); };
 function dailyBestToday() { return save.dailyKey === todayKey(new Date()) ? save.dailyBest : 0; }
 
-function startRun(daily) {
-  if (daily !== undefined) dailyMode = !!daily;
+function startRun(daily, ghost) {
+  if (daily !== undefined) { dailyMode = !!daily; ghostMode = !!ghost && !!save.ghost; }
   refillMissions();
-  reset(dailyMode ? dailySeed() : undefined); state = 'PLAY'; AU.init(); AU.beatT = 0;
-  // Улучшение «Старт с высоты» (не в Забеге дня, чтобы у всех было равно)
-  if (save.up.head > 0 && !dailyMode) {
+  reset(dailyMode ? dailySeed() : ghostMode ? save.ghost.seed : undefined); state = 'PLAY'; AU.init(); AU.beatT = 0;
+  // Улучшение «Старт с высоты» (не в Забеге дня и не в «Призраке», чтобы шахта совпадала)
+  if (save.up.head > 0 && !dailyMode && !ghostMode) {
+    headUsed = true;
     P.y = camY = save.up.head * 400; genY = P.y + 420; objs = []; ensureGen();
     nextMile = Math.floor(P.y / 1000) * 100 + 100; lastZone = zoneOf(P.y / 10);
   }
@@ -957,6 +989,13 @@ function update(dt) {
   if (invT > 0) invT -= dt;
   if (magnetT > 0) magnetT -= dt;
   if (feverT > 0) feverT -= dt;
+  darkK = Math.max(0, darkK - dt); // гаснет плавно, если игрок вышел из тёмного участка (внутри участка снова растёт)
+  ghostRecT += dt; // запись забега для режима «Призрак»: точка раз в 0.1 с
+  if (ghostRecT >= 0.1 && ghostRec.length < 12000) { ghostRecT -= 0.1; ghostRec.push(Math.round(P.x), Math.round(P.y)); }
+  if (ghostMode && save.ghost && !ghostBeat && heightM > save.ghost.h) {
+    ghostBeat = true; coinsRun += 40; save.stats.coins += 40;
+    banner = { t: L.ghostWin, sub: L.ghostWinSub, zone: true, c: '#e8e8ff', life: 2.4, max: 2.4 }; AU.best(); vib([20, 40, 20]);
+  }
   if (hasPet('dragon') && P.y > nextBurnY) { nextBurnY = P.y + 2500; dragonBurn(); }
   if (P.st === 'jump') {
     P.t += dt;
@@ -966,7 +1005,7 @@ function update(dt) {
   }
   P.sq -= P.sq * Math.min(1, dt * 14);
   P.trailT -= dt;
-  if (P.trailT <= 0) { P.trailT = 1 / 60; P.trail.push({ x: P.x, y: P.y }); if (P.trail.length > 16) P.trail.shift(); }
+  if (P.trailT <= 0) { P.trailT = 1 / 60; P.trail.push({ x: P.x, y: P.y, t: runTime }); if (P.trail.length > 16) P.trail.shift(); }
   heightM = P.y / 10;
   if ((heightM | 0) !== lastHM) { lastHM = heightM | 0; mission('height', lastHM); }
 
@@ -1005,6 +1044,22 @@ function update(dt) {
       if (!o.taken && Math.hypot(cx - o.x, cy - o.y) < 26) takeKey(o);
     } else if (o.type === 'letter') {
       if (!o.taken && Math.hypot(cx - o.x, cy - o.y) < 24) takeLetter(o);
+    } else if (o.type === 'roller') {
+      if (!o.act && o.y - P.y < VH) o.act = true;
+      if (o.act) { o.y -= 110 * dt; o.rot -= dt * 8 * o.side; }
+      const nx = Math.max(R.x, Math.min(o.x, R.x + R.w)), ny = Math.max(R.y, Math.min(o.y, R.y + R.h));
+      const d = Math.hypot(o.x - nx, o.y - ny);
+      if (d < o.r - 2) hit();
+      else if (!o.nm && d < o.r + CFG.near + 6 && o.y < P.y) { o.nm = true; nearMiss(o.x, o.y + 30); }
+    } else if (o.type === 'spring') {
+      if (!o.used && P.st === 'wall' && P.side === o.side && R.y < o.y + 24 && R.y + R.h > o.y) {
+        o.used = true; rocketT = Math.max(rocketT, 0.6); pts += 15; AU.power(); vib(15);
+        popup(L.spring + ' +15', P.x + 11, P.y + 40, PLAYER, 20); doJump();
+      }
+    } else if (o.type === 'dark') {
+      const inD = P.y > o.y && P.y < o.y + o.h;
+      if (inD && !o.seen) { o.seen = true; banner = { t: L.dark, sub: L.darkSub, zone: true, c: '#c7c7ff', life: 1.8, max: 1.8 }; }
+      if (inD) darkK = Math.min(1, darkK + dt * 2);
     } else if (o.type === 'bat') {
       // 0 — висит в центре; 1 — заметила игрока и пикирует к его стене
       if (o.st === 0 && o.y - P.y < speed * 1.05) { o.st = 1; const sd = P.st === 'jump' ? P.target : P.side; o.tx = sd < 0 ? LX + 12 : RX - 12; AU.turn(); }
@@ -1042,7 +1097,7 @@ function update(dt) {
   }
   // Новая зона (тема шахты): баннер с названием
   const z = zoneOf(heightM);
-  if (z > lastZone) { lastZone = z; banner = { t: L.zones[z], sub: L.zone, zone: true, life: 2.2, max: 2.2 }; AU.power(); vib([15, 30, 15]); }
+  if (z > lastZone) { lastZone = z; banner = { t: L.zones[z], sub: L.zone + ' · ' + L.speedUp, zone: true, life: 2.2, max: 2.2 }; AU.power(); vib([15, 30, 15]); }
   // Рубежи каждые 100 м: баннер и бонус монет, растущий с высотой
   if (heightM >= nextMile) {
     const bonus = Math.round(Math.min(5 + (nextMile / 100 - 1) * 3, 30) * (1 + tl('gold') * 0.1));
@@ -1217,6 +1272,23 @@ function drawObjects(t) {
       const y = sy(o.y) + Math.sin(t * 4) * 4; if (y < -30 || y > VH + 30) continue;
       ctx.fillStyle = 'rgba(255,210,63,0.16)'; ctx.beginPath(); ctx.arc(o.x, y, 18 + Math.sin(t * 6) * 2, 0, 7); ctx.fill();
       drawKey(o.x, y, 1, t);
+    } else if (o.type === 'roller') {
+      const y = sy(o.y); if (y < -30 || y > VH + 30) continue;
+      ctx.save(); ctx.translate(o.x, y); ctx.rotate(o.rot);
+      ctx.fillStyle = SPIKE; ctx.beginPath();
+      for (let i = 0; i < 14; i++) { const a = i / 14 * Math.PI * 2, rr2 = i % 2 ? o.r : o.r + 5; ctx.lineTo(Math.cos(a) * rr2, Math.sin(a) * rr2); }
+      ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#5a2030'; ctx.beginPath(); ctx.arc(0, 0, o.r - 4, 0, 7); ctx.fill();
+      ctx.restore();
+      if (o.act) { ctx.fillStyle = 'rgba(255,59,92,0.18)'; ctx.fillRect(o.x - 2, y - 40, 4, 26); } // след движения
+    } else if (o.type === 'spring') {
+      if (o.used) continue;
+      const y = sy(o.y + 24); if (y < -30 || y > VH + 30) continue;
+      const x0 = o.side < 0 ? LX : RX - 10, sq = Math.sin(t * 8) * 2;
+      ctx.fillStyle = PLAYER; ctx.fillRect(x0, y, 10, 24);
+      ctx.strokeStyle = '#10261c'; ctx.lineWidth = 2; ctx.beginPath();
+      for (let k = 0; k < 4; k++) { ctx.moveTo(x0 + 2, y + 4 + k * 5 + sq * 0.3); ctx.lineTo(x0 + 8, y + 6 + k * 5 + sq * 0.3); }
+      ctx.stroke();
     } else if (o.type === 'letter') {
       if (o.taken) continue;
       const y = sy(o.y) + Math.sin(t * 4 + o.y) * 3; if (y < -30 || y > VH + 30) continue;
@@ -1351,7 +1423,7 @@ function drawCube(x, y, w, h, sk, t, look) {
 function drawPlayer(t) {
   const th = theme(heightM), sk = SKINS[save.skin] || SKINS[0];
   if (state !== 'DYING' && state !== 'OVER' && state !== 'REVIVE') {
-    drawTrail(P.trail.map(p => ({ x: p.x + CFG.size / 2, y: sy(p.y) - CFG.size / 2 })), save.trail, t, sk.trail === 'rainbow' ? null : (sk.trail || rgb(th.acc)), 1);
+    drawTrail(P.trail.map(p => ({ x: p.x + CFG.size / 2, y: sy(p.y) - CFG.size / 2 + (runTime - (p.t || runTime)) * 140 })), save.trail, t, sk.trail === 'rainbow' ? null : (sk.trail || rgb(th.acc)), 1);
     let sw = 1, sh = 1;
     if (P.sq > 0) { sw = 1 - 0.3 * P.sq; sh = 1 + 0.3 * P.sq; }      // приземление: сплющивание вдоль стены
     else if (P.sq < 0) { sw = 1 - 0.25 * P.sq; sh = 1 + 0.25 * P.sq; } // толчок: вытягивание
@@ -1375,6 +1447,23 @@ function drawPlayer(t) {
     if (magnetT > 0) { ctx.strokeStyle = `rgba(255,127,240,${0.25 + 0.2 * Math.sin(t * 10)})`; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(P.x + 11, sy(P.y) - 11, 34, 0, 7); ctx.stroke(); }
   }
 }
+function ghostPos() {
+  const g = save.ghost; if (!g || !g.d || g.d.length < 4) return null;
+  const n = g.d.length / 2, f = runTime / 0.1, i = Math.min(n - 1, Math.floor(f)), j = Math.min(n - 1, i + 1), k = Math.min(1, f - i);
+  return { x: g.d[i * 2] + (g.d[j * 2] - g.d[i * 2]) * k, y: g.d[i * 2 + 1] + (g.d[j * 2 + 1] - g.d[i * 2 + 1]) * k, done: f >= n - 1 };
+}
+function drawGhost(t) {
+  if (!ghostMode || !save.ghost) return;
+  // финиш призрака: его прошлый рекорд
+  const fy = sy(save.ghost.h * 10);
+  if (fy > -20 && fy < VH + 20) { ctx.fillStyle = 'rgba(232,232,255,0.5)'; ctx.fillRect(LX, fy - 1, RX - LX, 2); txt('👻 ' + L.ghostEnd + ' ' + save.ghost.h + L.m, W / 2, fy - 12, 11, '#e8e8ff', 'center', 800, 0.8); }
+  const g = ghostPos(); if (!g || g.done) return;
+  const y = sy(g.y) - CFG.size;
+  if (y < -30 || y > VH + 30) return;
+  ctx.globalAlpha = 0.4 * UIA; drawCube(g.x, y, CFG.size, CFG.size, SKINS[save.skin] || SKINS[0], t, 0);
+  ctx.strokeStyle = 'rgba(232,232,255,0.8)'; ctx.lineWidth = 1.5; ctx.setLineDash([3, 3]); rrect(g.x - 3, y - 3, CFG.size + 6, CFG.size + 6, 7); ctx.stroke(); ctx.setLineDash([]);
+  ctx.globalAlpha = UIA; txt('👻', g.x + 11, y - 10, 12, '#fff', 'center', 700, 0.7);
+}
 function drawFX() {
   for (const p of parts) if (p.life > 0) {
     ctx.globalAlpha = Math.max(0, p.life / p.max); ctx.fillStyle = p.c;
@@ -1390,8 +1479,9 @@ const BTN = {
   pause: () => ({ x: 4, y: 8, w: 40, h: 40 }),
   sound: () => ({ x: W - 46, y: 8, w: 40, h: 40 }),
   vibB:  () => ({ x: W - 90, y: 8, w: 40, h: 40 }),
-  shop:  () => ({ x: 24, y: VH * 0.55, w: 150, h: 50 }),
-  daily: () => ({ x: 186, y: VH * 0.55, w: 150, h: 50 }),
+  shop:  () => ({ x: 24, y: VH * 0.55, w: 100, h: 50 }),
+  daily: () => ({ x: 130, y: VH * 0.55, w: 100, h: 50 }),
+  ghostB: () => ({ x: 236, y: VH * 0.55, w: 100, h: 50 }),
   x2:    () => ({ x: 70, y: CY() + 36, w: 220, h: 44 }),
   again: () => ({ x: 70, y: CY() + 88, w: 220, h: 60 }),
   toMenu:() => ({ x: 120, y: CY() + 156, w: 120, h: 34 }),
@@ -1496,8 +1586,13 @@ function drawHUD(t, th) {
     ctx.strokeStyle = it.c; ctx.lineWidth = 2; ctx.stroke();
     drawItemIcon(r.x + r.w / 2, r.y + r.h / 2 - 2, it.k, 1);
     txt(String(save.items[it.k]), r.x + r.w - 7, r.y + r.h - 7, 10, '#fff', 'center', 900);
+    txt(String(i + 1), r.x + 7, r.y + 8, 9, '#fff', 'center', 800, 0.55); // клавиша на ПК
     ctx.globalAlpha = UIA;
   });
+  if (ghostMode && save.ghost && !ghostBeat) {
+    const g = ghostPos();
+    if (g && !g.done) { const dm = Math.round((g.y - P.y) / 10); txt('👻 ' + (dm > 0 ? L.ghostAhead + ' ' + dm + ' ' + L.m : L.ghostBehind + ' ' + (-dm) + ' ' + L.m), W / 2, 140, 12, '#e8e8ff', 'center', 800, 0.85); }
+  }
   if (slowT > 0) { ctx.fillStyle = '#7fd8ff'; ctx.fillRect(W / 2 - 60, 128, 120 * (slowT / 4), 4); }
   iconPause(BTN.pause());
   if (dailyMode) txt(L.daily, 50, 28, 11, rgb(th.acc), 'left', 900);
@@ -1540,8 +1635,12 @@ function drawMenu(t, th) {
   button(BTN.shop(), L.shop, 'coin');
   const d = BTN.daily();
   button(d, '', 'ghost');
-  txt(L.daily, d.x + d.w / 2, d.y + 18, 15, '#fff', 'center', 900);
-  txt(L.dailyBest + ': ' + dailyBestToday(), d.x + d.w / 2, d.y + 36, 11, rgb(th.acc), 'center', 700);
+  txt(L.daily, d.x + d.w / 2, d.y + 18, 13, '#fff', 'center', 900);
+  txt(L.dailyBest + ': ' + dailyBestToday(), d.x + d.w / 2, d.y + 36, 10, rgb(th.acc), 'center', 700);
+  const gb = BTN.ghostB();
+  button(gb, '', 'ghost', !!save.ghost);
+  txt('👻 ' + L.ghost, gb.x + gb.w / 2, gb.y + 18, 13, '#fff', 'center', 900, save.ghost ? 1 : 0.5);
+  txt(save.ghost ? save.ghost.h + ' ' + L.m : L.ghostSub, gb.x + gb.w / 2, gb.y + 36, 10, rgb(th.acc), 'center', 700, save.ghost ? 1 : 0.5);
   const cb = BTN.chestB();
   if (save.keys >= 3) {
     button(cb, '', 'coin', true, t, true);
@@ -1794,7 +1893,7 @@ function drawOver(t, th) {
   ctx.globalAlpha = k * UIA;
   const cy = CY();
   panel(36, cy - 200, W - 72, 400, th);
-  txt(dailyMode ? L.daily : L.over, W / 2, cy - 165, 26, dailyMode ? rgb(th.acc) : '#ffffff', 'center', 900);
+  txt(dailyMode ? L.daily : ghostMode ? '👻 ' + L.ghost : L.over, W / 2, cy - 165, 26, dailyMode || ghostMode ? rgb(th.acc) : '#ffffff', 'center', 900);
   // счёт «набегает» от нуля
   const ck = Math.min(1, overT / 0.9), shown = Math.floor(score * (1 - Math.pow(1 - ck, 3)));
   txt(String(shown), W / 2, cy - 112, 60, '#ffffff', 'center', 900);
@@ -1907,9 +2006,15 @@ function render(t) {
   ctx.save(); ctx.beginPath(); ctx.rect(0, 0, W, VH); ctx.clip();
   drawWorld(th);
   if (feverT > 0 && state === 'PLAY') { ctx.fillStyle = 'rgba(255,210,63,0.06)'; ctx.fillRect(0, 0, W, VH); }
-  drawObjects(t); drawPlayer(t);
+  drawObjects(t); drawGhost(t); drawPlayer(t);
   if (!['DYING', 'OVER', 'REVIVE'].includes(state)) save.petOn.forEach((k, i) => { if (i < 3) drawPet(petPs[i].x, sy(petPs[i].y), k, t + i); });
   drawFX();
+  if (darkK > 0 && P) { // тёмный участок: светлый круг вокруг игрока
+    const px = P.x + 11, py = sy(P.y) - 11;
+    const gr = ctx.createRadialGradient(px, py - 40, 90, px, py - 40, 240);
+    gr.addColorStop(0, 'rgba(0,0,0,0)'); gr.addColorStop(1, `rgba(0,0,0,${0.9 * darkK})`);
+    ctx.fillStyle = gr; ctx.fillRect(0, 0, W, VH);
+  }
   if (flashT > 0) { ctx.fillStyle = `rgba(255,255,255,${flashT * 0.15})`; ctx.fillRect(0, 0, W, VH); }
   ctx.restore();
   ctx.setTransform(s, 0, 0, s, dpr * offX, dpr * offY);
@@ -1971,6 +2076,7 @@ function press(p, fromKey) {
     if (!fromKey && inR(p, BTN.vibB())) { toggleVib(); return; }
     if (!fromKey && inR(p, BTN.shop())) { state = 'SHOP'; return; }
     if (!fromKey && inR(p, BTN.daily())) { startRun(true); return; }
+    if (!fromKey && inR(p, BTN.ghostB())) { if (save.ghost) startRun(false, true); else showToast(L.ghostNone); return; }
     if (!fromKey && inR(p, BTN.ach())) { state = 'ACH'; return; }
     if (!fromKey && inR(p, BTN.help())) { state = 'TUTOR'; return; }
     if (!fromKey && inR(p, BTN.chestB())) { if (save.keys >= 3) openChest(); return; }
@@ -2060,6 +2166,7 @@ window.addEventListener('keydown', e => {
     else if (state === 'REVIVE' && reviveLock <= 0) gameOver();
   }
   else if (k === 'KeyM') toggleSound();
+  else if (state === 'PLAY' && !adBusy) { const ix = ['Digit1', 'Digit2', 'Digit3'].indexOf(k) >= 0 ? ['Digit1', 'Digit2', 'Digit3'].indexOf(k) : ['KeyZ', 'KeyX', 'KeyC'].indexOf(k); if (ix >= 0) useItem(ITEMS[ix].k); }
 });
 // В Playables пауза только по onPause/onResume (Page Visibility API запрещён); вне YouTube — по сворачиванию вкладки
 if (!YT.inYT) {
@@ -2113,7 +2220,7 @@ Promise.all([
 });
 
 // для автотестов и отладки
-window.__game = { get state() { return state; }, get score() { return score; }, get height() { return heightM; }, get P() { return P; }, get objs() { return objs; }, tap: () => press({ x: W / 2, y: VH / 2 }, true), click: (x, y) => press({ x, y }, false), BTN, save, get daily() { return dailyMode; }, warp(y) { P.y = camY = y; genY = y + 420; objs = []; ensureGen(); }, get VH() { return VH; }, get chest() { return chest; }, useItem, get letters() { return lettersGot; } };
+window.__game = { get state() { return state; }, get score() { return score; }, get height() { return heightM; }, get P() { return P; }, get objs() { return objs; }, tap: () => press({ x: W / 2, y: VH / 2 }, true), click: (x, y) => press({ x, y }, false), BTN, save, get daily() { return dailyMode; }, warp(y) { P.y = camY = y; genY = y + 420; objs = []; ensureGen(); }, get VH() { return VH; }, get chest() { return chest; }, startRun, get ghostMode() { return ghostMode; }, get speed() { return speed; }, get darkK() { return darkK; }, useItem, get letters() { return lettersGot; } };
 })();
 </script>
 </body>
